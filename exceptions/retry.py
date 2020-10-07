@@ -1,0 +1,2 @@
+class RetryBatch(Exception):
+    pass
