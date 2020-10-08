@@ -1,6 +1,8 @@
 import mongoengine
+import requests
 from werkzeug.security import check_password_hash, generate_password_hash
 
+import sdk
 from . import datetimeProvider
 
 
@@ -22,6 +24,19 @@ class User(mongoengine.Document):
 
     def checkPassword(self, password) -> bool:
         return check_password_hash(self.passwordHash, password)
+
+    @classmethod
+    def new(cls, email, password):
+        newUser = cls(
+            email=email,
+        )
+        newUser.setPassword(password)
+        newUser.save()
+        PollingSliceUserAssignment(
+            user=newUser,
+            slice=None
+        ).save()
+        return newUser
 
 
 class UserSession(mongoengine.Document):
@@ -111,3 +126,82 @@ class InconsistencyCase(mongoengine.Document):
     record = mongoengine.ReferenceField(InconsistencyRecord, required=True)
     state = mongoengine.StringField(required=True, default="unresolved") # unresolved, error, resolved
 
+
+class ChangeProcessor(mongoengine.Document):
+    live = mongoengine.BooleanField(default=True)
+    lastHeartbeat = mongoengine.DateTimeField(required=True, default=datetimeProvider.get_current_time)
+    heartbeatSecret = mongoengine.StringField(required=True)
+    connectionString = mongoengine.StringField(required=True)
+
+    def allocate_queues(self, listOfQueueIDs):
+        requests.post(f"{self.connectionString}allocate_queues", json=listOfQueueIDs)
+
+
+class ProcessingSlice(mongoengine.Document):
+    processor = mongoengine.ReferenceField(ChangeProcessor)
+    usersAllocated = mongoengine.IntField(required=True, default=0)
+
+    def allocate_users(self, listOfUsers):
+        user: sdk.dbModels.User
+        for user in listOfUsers:
+            self.usersAllocated += 1
+            self.save()
+            ProcessingSliceUserAssignment(
+                slice=self,
+                user=user
+            ).save()
+        try:
+            self.processor.allocate_queues([str(user.id) for user in listOfUsers])
+        except requests.RequestException:
+            self.processor.live = False
+            self.processor.save()
+            # TODO: Write more failover here.
+            print("Failed to communicate with processor.")
+
+
+class ProcessingSliceUserAssignment(mongoengine.Document):
+    slice = mongoengine.ReferenceField(ProcessingSlice, required=True)
+    user = mongoengine.ReferenceField(User, required=True)
+
+
+class ChangePoller(mongoengine.Document):
+    live = mongoengine.BooleanField(default=True)
+    lastHeartbeat = mongoengine.DateTimeField(required=True, default=datetimeProvider.get_current_time)
+    heartbeatSecret = mongoengine.StringField(required=True)
+    connectionString = mongoengine.StringField(required=True)
+
+    def allocate_users(self, listOfUserPollingJSON):
+        print(listOfUserPollingJSON)
+
+
+class PollingSlice(mongoengine.Document):
+    poller = mongoengine.ReferenceField(ChangePoller, required=True)
+    usersAllocated = mongoengine.IntField(required=True, default=0)
+
+    def allocateUsers(self, listOfUsers):
+        user: sdk.dbModels.User
+        for user in listOfUsers:
+            self.usersAllocated += 1
+            self.save()
+            PollingSliceUserAssignment(
+                user=user,
+                slice=self
+            ).save()
+        self.poller.allocate_users([generate_user_polling_json(user) for user in listOfUsers])
+
+
+class PollingSliceUserAssignment(mongoengine.Document):
+    user = mongoengine.ReferenceField(User, required=True)
+    slice = mongoengine.ReferenceField(PollingSlice)
+
+
+def generate_user_polling_json(userObject):
+    return {
+        "id": str(userObject.id),
+        "platforms": [
+            {
+                "identifier": platformReg.platform.platformIdentifier,
+                "credentials": platformReg.credentials
+            } for platformReg in userObject.platformRegistrations if platformReg.active
+        ]
+    }
